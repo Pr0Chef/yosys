@@ -20,9 +20,35 @@
 #include "kernel/register.h"
 #include "kernel/yosys_common.h"
 #include "kernel/utils.h"
+#include "kernel/threading.h"
+
+#if defined(YOSYS_ENABLE_THREADS) && !defined(YOSYS_LINK_ABC) && !defined(__wasm) && !defined(_WIN32)
+// ABC runs as an external process, so several of them can run at once
+#  define ABC_NEW_PARALLEL
+#  include <cstdlib>
+#  include <sys/wait.h>
+#endif
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
+
+#ifdef ABC_NEW_PARALLEL
+struct AbcJob {
+	std::string tmpdir;
+	std::string command;
+	bool done = false;
+};
+
+// Runs off the main thread, so it must not touch the design or the log
+void run_abc_job(const AbcJob &job)
+{
+	std::string cmd = stringf("%s > %s/abc.out 2>&1", job.command, job.tmpdir);
+	int status = std::system(cmd.c_str());
+	int ret = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+	std::ofstream ret_file(stringf("%s/abc.ret", job.tmpdir));
+	ret_file << ret << "\n";
+}
+#endif
 
 std::vector<Module*> order_modules(Design *design, std::vector<Module *> modules)
 {
@@ -86,6 +112,14 @@ struct AbcNewPass : public ScriptPass {
 		log("        the ABC tool on individual modules of the design. please see\n");
 		log("        'help abc9_exe' for more details\n");
 		log("\n");
+		log("    -j <num>\n");
+		log("        run ABC on up to <num> modules at once. a module is mapped once all\n");
+		log("        of its selected submodules are, and the results are reintegrated in\n");
+		log("        the same order as below, so for any <num> above 1 the output is the\n");
+		log("        same and does not depend on which ABC process finishes first. the\n");
+		log("        default is the number of available cores (see YOSYS_MAX_THREADS).\n");
+		log("        -j 1 maps the modules one at a time as in the script below.\n");
+		log("\n");
 		log("[1] http://www.eecs.berkeley.edu/~alanmi/abc/\n");
 		log("\n");
 		help_script();
@@ -94,12 +128,14 @@ struct AbcNewPass : public ScriptPass {
 
 	bool cleanup;
 	std::string abc_exe_options;
+	int num_jobs;
 
 	void execute(std::vector<std::string> args, RTLIL::Design *d) override
 	{
 		std::string run_from, run_to;
 		cleanup = true;
 		abc_exe_options.clear();
+		num_jobs = INT_MAX;
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-exe" || args[argidx] == "-script" ||
@@ -116,6 +152,10 @@ struct AbcNewPass : public ScriptPass {
 				run_to = args[argidx].substr(pos + 1);
 			} else if (args[argidx] == "-nocleanup") {
 				cleanup = false;
+			} else if (args[argidx] == "-j" && argidx + 1 < args.size()) {
+				num_jobs = atoi(args[++argidx].c_str());
+				if (num_jobs < 1)
+					log_cmd_error("Invalid -j value '%s'.\n", args[argidx]);
 			} else {
 				break;
 			}
@@ -168,6 +208,14 @@ struct AbcNewPass : public ScriptPass {
 				selected_modules = {nullptr};
 				run("foreach module in selection");
 			}
+
+#ifdef ABC_NEW_PARALLEL
+			int num_workers = help_mode ? 0 : ThreadPool::pool_size(0, num_jobs);
+			if (num_workers > 1 && GetSize(selected_modules) > 1) {
+				map_parallel(selected_modules, num_workers);
+				selected_modules.clear();
+			}
+#endif
 
 			for (auto mod : selected_modules) {
 				std::string tmpdir = "<abc-temp-dir>";
@@ -224,6 +272,135 @@ struct AbcNewPass : public ScriptPass {
 			}
 		}
 	}
+
+#ifdef ABC_NEW_PARALLEL
+	// Same steps as the sequential loop in script(), split so that the abc9_exe
+	// step of many modules runs on worker threads. Everything that touches the
+	// design runs here on the main thread, in an order that depends only on the
+	// module order, never on when an ABC process finishes.
+	void map_parallel(const std::vector<Module *> &modules, int num_workers)
+	{
+		int n = GetSize(modules);
+		dict<Module *, int> index;
+		for (int i = 0; i < n; i++)
+			index[modules[i]] = i;
+
+		// The same edges order_modules() sorted by: modules[i] waits for its
+		// selected submodules, which all come before it
+		std::vector<std::vector<int>> deps(n);
+		for (int i = 0; i < n; i++) {
+			pool<int> seen;
+			for (auto cell : modules[i]->cells()) {
+				Module *submodule = active_design->module(cell->type);
+				if (submodule && index.count(submodule) && seen.insert(index.at(submodule)).second)
+					deps[i].push_back(index.at(submodule));
+			}
+		}
+
+		std::vector<AbcJob> jobs(n);
+		std::vector<bool> launched(n, false), mapped(n, false);
+		Mutex done_mutex;
+		CondVar done_cond;
+		ConcurrentQueue<int> work_queue;
+
+		log("Running ABC on %d modules with up to %d concurrent processes.\n", n, num_workers);
+
+		ThreadPool workers(num_workers, [&](int) {
+			while (std::optional<int> i = work_queue.pop_front()) {
+				run_abc_job(jobs[*i]);
+				{
+					LockGuard lock(done_mutex);
+					jobs[*i].done = true;
+				}
+				done_cond.notify_all();
+			}
+		});
+		// Declared after `workers` so the queue is closed, and the workers can
+		// exit, before they are joined, also when an error unwinds this function
+		struct QueueCloser {
+			ConcurrentQueue<int> &queue;
+			~QueueCloser() { queue.close(); }
+		} closer{work_queue};
+
+		for (int next = 0; next < n; next++) {
+			for (int i = next; i < n; i++) {
+				if (launched[i])
+					continue;
+				bool ready = true;
+				for (int dep : deps[i])
+					ready = ready && mapped[dep];
+				if (!ready)
+					continue;
+				prepare_module(modules[i], jobs[i]);
+				launched[i] = true;
+				work_queue.push_back(i);
+			}
+
+			log_assert(launched[next]);
+			{
+				UniqueLock lock(done_mutex);
+				done_cond.wait(lock, [&] { return jobs[next].done; });
+			}
+			collect_module(modules[next], jobs[next]);
+			mapped[next] = true;
+		}
+	}
+
+	void prepare_module(Module *mod, AbcJob &job)
+	{
+		job.tmpdir = cleanup ? (get_base_tmpdir() + "/") : "_tmp_";
+		job.tmpdir += proc_program_prefix() + "yosys-abc-XXXXXX";
+		job.tmpdir = make_temp_dir(job.tmpdir);
+		log_header(active_design, "Preparing module '%s' for ABC.\n", mod);
+		log_push();
+		active_design->select(mod);
+
+		std::string script_save;
+		if (mod->has_attribute(ID(abc9_script))) {
+			script_save = active_design->scratchpad_get_string("abc9.script");
+			active_design->scratchpad_set_string("abc9.script",
+				mod->get_string_attribute(ID(abc9_script)));
+		}
+
+		run(stringf("  abc9_ops -write_box %s/input.box", job.tmpdir));
+		run(stringf("  write_xaiger2 -mapping_prep -map2 %s/input.map2 %s/input.xaig", job.tmpdir, job.tmpdir));
+		run(stringf("  abc9_exe %s -prepare -cwd %s -box %s/input.box", abc_exe_options, job.tmpdir, job.tmpdir));
+		job.command = active_design->scratchpad_get_string("abc9_exe.command");
+		active_design->scratchpad_unset("abc9_exe.command");
+
+		if (mod->has_attribute(ID(abc9_script))) {
+			if (script_save.empty())
+				active_design->scratchpad_unset("abc9.script");
+			else
+				active_design->scratchpad_set_string("abc9.script", script_save);
+		}
+
+		active_design->selection().selected_modules.clear();
+		log_pop();
+	}
+
+	void collect_module(Module *mod, const AbcJob &job)
+	{
+		log_header(active_design, "Mapping module '%s'.\n", mod);
+		log_push();
+		active_design->select(mod);
+
+		run(stringf("  abc9_exe %s -collect -cwd %s -box %s/input.box", abc_exe_options, job.tmpdir, job.tmpdir));
+		run(stringf("  read_aiger -xaiger -module_name %s$abc9 %s/output.aig",
+					mod->name.str(), job.tmpdir));
+		run(stringf("  abc_ops_reintegrate -stdcell -map %s/input.map2", job.tmpdir));
+
+		active_design->selection().selected_modules.clear();
+		log_pop();
+
+		if (mod->get_bool_attribute(ID(abc9_deferred_box))) {
+			mod->set_bool_attribute(ID(abc9_deferred_box), false);
+			mod->set_bool_attribute(ID::abc9_box, true);
+			Pass::call_on_module(active_design, mod, "portarcs -draw -write");
+			run("abc9_ops -prep_box");
+		}
+	}
+#endif
 } AbcNewPass;
 
 PRIVATE_NAMESPACE_END
