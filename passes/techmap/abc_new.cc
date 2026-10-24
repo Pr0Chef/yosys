@@ -36,6 +36,10 @@ PRIVATE_NAMESPACE_BEGIN
 struct AbcJob {
 	std::string tmpdir;
 	std::string command;
+	// abc9_box_id of every box module when the job's input was written. Mapping a
+	// deferred box in the meantime renumbers them (abc9_ops -prep_box), but the
+	// mapped netlist refers to the boxes by the old numbers.
+	dict<IdString, Const> box_ids;
 	bool done = false;
 };
 
@@ -367,6 +371,9 @@ struct AbcNewPass : public ScriptPass {
 		run(stringf("  abc9_exe %s -prepare -cwd %s -box %s/input.box", abc_exe_options, job.tmpdir, job.tmpdir));
 		job.command = active_design->scratchpad_get_string("abc9_exe.command");
 		active_design->scratchpad_unset("abc9_exe.command");
+		for (auto box : active_design->modules())
+			if (box->has_attribute(ID::abc9_box_id))
+				job.box_ids[box->name] = box->attributes.at(ID::abc9_box_id);
 
 		if (mod->has_attribute(ID(abc9_script))) {
 			if (script_save.empty())
@@ -386,9 +393,20 @@ struct AbcNewPass : public ScriptPass {
 		active_design->select(mod);
 
 		run(stringf("  abc9_exe %s -collect -cwd %s -box %s/input.box", abc_exe_options, job.tmpdir, job.tmpdir));
+
+		dict<IdString, Const> current_box_ids;
+		for (auto &it : job.box_ids) {
+			Module *box = active_design->module(it.first);
+			if (!box || !box->has_attribute(ID::abc9_box_id))
+				continue;
+			current_box_ids[it.first] = box->attributes.at(ID::abc9_box_id);
+			box->attributes[ID::abc9_box_id] = it.second;
+		}
 		run(stringf("  read_aiger -xaiger -module_name %s$abc9 %s/output.aig",
 					mod->name.str(), job.tmpdir));
 		run(stringf("  abc_ops_reintegrate -stdcell -map %s/input.map2", job.tmpdir));
+		for (auto &it : current_box_ids)
+			active_design->module(it.first)->attributes[ID::abc9_box_id] = it.second;
 
 		active_design->selection().selected_modules.clear();
 		log_pop();
