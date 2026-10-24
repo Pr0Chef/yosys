@@ -348,6 +348,19 @@ struct AbcNewPass : public ScriptPass {
 			collect_module(modules[next], jobs[next]);
 			mapped[next] = true;
 		}
+
+		// portarcs leaves the $input_port cells of buffer-normalized mode in the
+		// design. The sequential loop mostly hides that because the next
+		// write_xaiger2 removes them, but here many modules are mapped after the
+		// last write_xaiger2.
+		for (auto module : active_design->modules()) {
+			std::vector<Cell *> to_remove;
+			for (auto cell : module->cells())
+				if (cell->type == ID($input_port))
+					to_remove.push_back(cell);
+			for (auto cell : to_remove)
+				module->remove(cell);
+		}
 	}
 
 	void prepare_module(Module *mod, AbcJob &job)
