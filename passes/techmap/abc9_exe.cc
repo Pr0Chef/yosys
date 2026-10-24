@@ -168,6 +168,16 @@ struct abc9_output_filter
 	}
 };
 
+void check_abc9_result(int ret, const std::string &command, const std::string &tempdir_name)
+{
+	if (ret != 0) {
+		if (check_file_exists(stringf("%s/output.aig", tempdir_name)))
+			log_warning("ABC: execution of command \"%s\" failed: return code %d.\n", command, ret);
+		else
+			log_error("ABC: execution of command \"%s\" failed: return code %d.\n", command, ret);
+	}
+}
+
 void abc9_module(RTLIL::Design *design, std::string script_file, std::string exe_file,
 		vector<int> lut_costs, bool dff_mode, std::string delay_target,
 		bool show_tempdir, std::string box_file, std::string lut_file,
@@ -336,12 +346,7 @@ void abc9_module(RTLIL::Design *design, std::string script_file, std::string exe
 		filt.next_line(line + "\n");
 	temp_stdouterr_r.close();
 #endif
-	if (ret != 0) {
-		if (check_file_exists(stringf("%s/output.aig", tempdir_name)))
-			log_warning("ABC: execution of command \"%s\" failed: return code %d.\n", buffer, ret);
-		else
-			log_error("ABC: execution of command \"%s\" failed: return code %d.\n", buffer, ret);
-	}
+	check_abc9_result(ret, buffer, tempdir_name);
 }
 
 struct Abc9ExePass : public Pass {
