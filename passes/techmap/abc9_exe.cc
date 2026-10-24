@@ -168,6 +168,17 @@ struct abc9_output_filter
 	}
 };
 
+// ABC9_EXE_PREPARE only writes the ABC script and leaves the command to run it in the
+// "abc9_exe.command" scratchpad variable, so a caller (e.g. abc_new) can run several ABC
+// processes concurrently. Such a caller must run the command with its combined stdout and
+// stderr in <cwd>/abc.out and its exit status in <cwd>/abc.ret, and then call ABC9_EXE_COLLECT
+// to log that output and check the result.
+enum Abc9ExeMode {
+	ABC9_EXE_RUN,
+	ABC9_EXE_PREPARE,
+	ABC9_EXE_COLLECT,
+};
+
 void check_abc9_result(int ret, const std::string &command, const std::string &tempdir_name)
 {
 	if (ret != 0) {
@@ -178,12 +189,38 @@ void check_abc9_result(int ret, const std::string &command, const std::string &t
 	}
 }
 
+void abc9_collect(RTLIL::Design *design, std::string exe_file, bool show_tempdir, std::string tempdir_name)
+{
+	log_header(design, "Executing ABC9.\n");
+
+	std::string buffer = stringf("\"%s\" -s -f %s/abc.script 2>&1", exe_file, tempdir_name);
+	log("Running ABC command: %s\n", replace_tempdir(buffer, tempdir_name, show_tempdir));
+
+	abc9_output_filter filt(tempdir_name, show_tempdir);
+	std::ifstream output(stringf("%s/abc.out", tempdir_name));
+	for (std::string line; std::getline(output, line); )
+		filt.next_line(line + "\n");
+
+	int ret = -1;
+	std::ifstream ret_file(stringf("%s/abc.ret", tempdir_name));
+	if (!(ret_file >> ret))
+		log_error("ABC: no exit status found for command \"%s\".\n", buffer);
+
+	check_abc9_result(ret, buffer, tempdir_name);
+}
+
 void abc9_module(RTLIL::Design *design, std::string script_file, std::string exe_file,
 		vector<int> lut_costs, bool dff_mode, std::string delay_target,
 		bool show_tempdir, std::string box_file, std::string lut_file,
 		std::vector<std::string> liberty_files, std::string wire_delay, std::string tempdir_name,
-		std::string constr_file, std::vector<std::string> dont_use_cells, std::vector<std::string> genlib_files)
+		std::string constr_file, std::vector<std::string> dont_use_cells, std::vector<std::string> genlib_files,
+		Abc9ExeMode mode)
 {
+	if (mode == ABC9_EXE_COLLECT) {
+		abc9_collect(design, exe_file, show_tempdir, tempdir_name);
+		return;
+	}
+
 	std::string abc9_script;
 
 	if (!lut_costs.empty())
@@ -284,7 +321,8 @@ void abc9_module(RTLIL::Design *design, std::string script_file, std::string exe
 
 	std::string buffer;
 
-	log_header(design, "Executing ABC9.\n");
+	if (mode == ABC9_EXE_RUN)
+		log_header(design, "Executing ABC9.\n");
 
 	if (!lut_costs.empty()) {
 		buffer = stringf("%s/lutdefs.txt", tempdir_name);
@@ -294,6 +332,11 @@ void abc9_module(RTLIL::Design *design, std::string script_file, std::string exe
 		for (int i = 0; i < GetSize(lut_costs); i++)
 			fprintf(f, "%d %d.00 1.00\n", i+1, lut_costs.at(i));
 		fclose(f);
+	}
+
+	if (mode == ABC9_EXE_PREPARE) {
+		design->scratchpad_set_string("abc9_exe.command", stringf("\"%s\" -s -f %s/abc.script", exe_file, tempdir_name));
+		return;
 	}
 
 	buffer = stringf("\"%s\" -s -f %s/abc.script 2>&1", exe_file, tempdir_name);
@@ -443,6 +486,16 @@ struct Abc9ExePass : public Pass {
 		log("        file is expected. temporary files will be created in this directory, and\n");
 		log("        the mapped result will be written to 'output.aig'.\n");
 		log("\n");
+		log("    -prepare\n");
+		log("        only write the ABC script into the -cwd directory and store the command\n");
+		log("        that runs it in the 'abc9_exe.command' scratchpad variable. the caller\n");
+		log("        runs that command, writing its combined stdout and stderr to\n");
+		log("        '<cwd>/abc.out' and its exit status to '<cwd>/abc.ret'.\n");
+		log("\n");
+		log("    -collect\n");
+		log("        do not run ABC, instead log the output of a command from a previous\n");
+		log("        -prepare call and check its exit status.\n");
+		log("\n");
 		log("Note that this is a logic optimization pass within Yosys that is calling ABC\n");
 		log("internally. This is not going to \"run ABC on your design\". It will instead run\n");
 		log("ABC on logic snippets extracted from your design. You will not get any useful\n");
@@ -465,6 +518,7 @@ struct Abc9ExePass : public Pass {
 		bool dff_mode = false;
 		bool show_tempdir = false;
 		vector<int> lut_costs;
+		Abc9ExeMode mode = ABC9_EXE_RUN;
 
 #if 0
 		cleanup = false;
@@ -524,6 +578,14 @@ struct Abc9ExePass : public Pass {
 			}
 			if (arg == "-showtmp") {
 				show_tempdir = true;
+				continue;
+			}
+			if (arg == "-prepare") {
+				mode = ABC9_EXE_PREPARE;
+				continue;
+			}
+			if (arg == "-collect") {
+				mode = ABC9_EXE_COLLECT;
 				continue;
 			}
 			if (arg == "-box" && argidx+1 < args.size()) {
@@ -622,7 +684,7 @@ struct Abc9ExePass : public Pass {
 		abc9_module(design, script_file, exe_file, lut_costs, dff_mode,
 				delay_target, show_tempdir,
 				box_file, lut_file, liberty_files, wire_delay, tempdir_name,
-				constr_file, dont_use_cells, genlib_files);
+				constr_file, dont_use_cells, genlib_files, mode);
 	}
 } Abc9ExePass;
 
