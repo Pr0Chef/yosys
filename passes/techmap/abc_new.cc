@@ -327,14 +327,22 @@ struct AbcNewPass : public ScriptPass {
 		} closer{work_queue};
 
 		for (int next = 0; next < n; next++) {
+			std::vector<int> ready_modules;
 			for (int i = next; i < n; i++) {
 				if (launched[i])
 					continue;
 				bool ready = true;
 				for (int dep : deps[i])
 					ready = ready && mapped[dep];
-				if (!ready)
-					continue;
+				if (ready)
+					ready_modules.push_back(i);
+			}
+			// Start the largest modules first, so that a long ABC run does not
+			// begin last and hold up everything that waits for it
+			std::stable_sort(ready_modules.begin(), ready_modules.end(), [&](int a, int b) {
+				return GetSize(modules[a]->cells_) > GetSize(modules[b]->cells_);
+			});
+			for (int i : ready_modules) {
 				prepare_module(modules[i], jobs[i]);
 				launched[i] = true;
 				work_queue.push_back(i);
